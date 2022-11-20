@@ -2,6 +2,7 @@ use futures::future::{BoxFuture, FutureExt};
 use futures::task::{waker_ref, ArcWake};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -11,7 +12,7 @@ struct Hello {
 
 enum StateHello {
     Hello,
-    Wolrd,
+    World,
     End,
 }
 
@@ -26,24 +27,22 @@ impl Hello {
 impl Future for Hello {
     type Output = ();
 
-    // 実行関数 <3>
-    fn poll(mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>) -> Poll<()> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         match (*self).state {
             StateHello::Hello => {
                 print!("Hello, ");
-                // WORLD状態に遷移
-                (*self).state = StateHello::Wolrd;
-                Poll::Pending // 再度呼び出し可能
+                (*self).state = StateHello::World;
+                cx.waker().wake_by_ref(); // 自身を実行キューにエンキュー
+                Poll::Pending
             }
-            StateHello::Wolrd => {
+            StateHello::World => {
                 println!("World!");
-                // END状態に遷移
                 (*self).state = StateHello::End;
-                Poll::Pending // 再度呼び出し可能
+                cx.waker().wake_by_ref(); // 自身を実行キューにエンキュー
+                Poll::Pending
             }
             StateHello::End => {
-                Poll::Ready(()) // 終了
+                Poll::Ready(())
             }
         }
     }
@@ -51,33 +50,67 @@ impl Future for Hello {
 
 // 実行単位 <1>
 struct Task {
-    hello: Mutex<BoxFuture<'static, ()>>,
+    future: Mutex<BoxFuture<'static, ()>>,
+    sender: SyncSender<Arc<Task>>,
 }
 
-impl Task {
+impl ArcWake for  Task {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        // 自身をスケジューリング
+        let self0 = arc_self.clone();
+        arc_self.sender.send(self0).unwrap();
+    }
+}
+
+struct Executor {
+    sender: SyncSender<Arc<Task>>,
+    receiver: Receiver<Arc<Task>>,
+}
+
+impl Executor {
     fn new() -> Self {
-        let hello = Hello::new();
-        Task {
-            hello: Mutex::new(hello.boxed()),
+        let (sender, receiver) = sync_channel(1024);
+        Executor { 
+            sender: sender.clone(),
+            receiver,
+        }
+    }
+
+    fn get_spawner(&self) -> Spawner {
+        Spawner { 
+            sender: self.sender.clone(), 
+        }
+    }
+
+    fn run(&self) {
+        while let Ok(task) = self.receiver.recv() {
+            let mut future = task.future.lock().unwrap();
+            let waker = waker_ref(&task);
+            let mut ctx = Context::from_waker(&waker);
+            let _ = future.as_mut().poll(&mut ctx);
         }
     }
 }
 
-// 何もしない
-impl ArcWake for Task {
-    fn wake_by_ref(_arc_self: &Arc<Self>) {}
+struct Spawner { 
+    sender: SyncSender<Arc<Task>>,
 }
 
+impl Spawner {
+    fn spawn(&self, future: impl Future<Output = ()> + 'static + Send) { // <2>
+        let future = future.boxed();    // FutureをBox化
+        let task = Arc::new(Task {      // Task生成
+            future: Mutex::new(future),
+            sender: self.sender.clone(),
+        });
+
+        // 実行キューにエンキュー
+        self.sender.send(task).unwrap();
+    }
+}
 
 fn main() {
-    // 初期化
-    let task = Arc::new(Task::new());
-    let waker = waker_ref(&task);
-    let mut ctx = Context::from_waker(&waker); // <2>
-    let mut hello = task.hello.lock().unwrap();
-
-    // 停止と再開の繰り返し <3>
-    hello.as_mut().poll(&mut ctx);
-    hello.as_mut().poll(&mut ctx);
-    hello.as_mut().poll(&mut ctx);
+    let executor = Executor::new();
+    executor.get_spawner().spawn(Hello::new());
+    executor.run();
 }
