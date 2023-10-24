@@ -1,10 +1,30 @@
 # concurrent-programming-with-rust
 
-- GitHub
-  - [GitHub](https://github.com/oreilly-japan/conc_ytakano)
+- [GitHub](https://github.com/oreilly-japan/conc_ytakano)
 
 - clean
 
 ```text
 cargo-clean-recursive
 ```
+
+- Memory Ordering
+  - Relaxed
+    - メモリ順序は保証せず、アトミック性とメモリ順序の変更の一貫性だけを保証する
+  - Release
+    - メモリ順序付け命令より後続にあるメモリアクセス命令が、メモリ順序付け命令より前倒しになることを禁止する。
+  - Aquire
+    - メモリ順序付け命令に先行するメモリアクセス命令が、メモリ順序付け命令より後回しにされることを禁止する
+  - AcqRel
+    - 読み取り部分をAcquire、書き込み部分をRelease として扱う
+  - SeqCst
+    - AcqRel に加えて、逐次一貫モデルに基づく順序を保証する
+      - 逐次一貫モデル
+        - 各スレッド内の操作（命令）は順序通りに実行されるものとみなされます。つまり、各スレッド内の操作は逐次的に実行され、その順序は変更されません。
+        - 異なるスレッド間での操作の順序は一貫していると仮定されます。つまり、他のスレッドで発生した操作が、全てのスレッドに対して一貫して、一つの順序で現れるとみなされます。
+  - happens-before
+    - 以下を考えると、最初の操作と最後の操作に順序関係が保証される。これをhappens-beforeの関係という。
+      - (既にロックを取得している)スレッドAが、非アトミックな操作をする。
+      - スレッドAが、ロックを解放する。 (Release書き込み)
+      - スレッドBが、ロックを取得する。 (Acquire読み込み+Relaxed書き込み)
+      - スレッドBが、非アトミックな操作をする。
