@@ -1,5 +1,0 @@
-[workspace]
-members = [
-    "ch4_*"
-]
-resolver = "2"
