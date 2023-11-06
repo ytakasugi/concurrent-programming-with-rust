@@ -6,7 +6,8 @@ fn main() {
     let listener = TcpListener::bind("127.0.0.1:10000").unwrap(); // <1>
 
     // コネクション要求をアクセプト
-    while let Ok((stream, _)) = listener.accept() { // <2>
+    while let Ok((stream, _)) = listener.accept() {
+        // <2>
         // 読み込み、書き込みオブジェクトを生成 <3>
         let stream0 = stream.try_clone().unwrap();
         let mut reader = BufReader::new(stream0);

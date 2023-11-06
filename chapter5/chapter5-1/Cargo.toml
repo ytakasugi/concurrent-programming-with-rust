@@ -1,5 +1,6 @@
 [workspace]
 members = [
-    "ch5_*"
+    "ch5_1_conc",
+    "ch5_1_iter"
 ]
 resolver = "2"
