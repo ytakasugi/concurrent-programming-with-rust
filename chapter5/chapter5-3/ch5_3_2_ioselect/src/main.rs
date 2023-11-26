@@ -130,8 +130,7 @@ impl IOSelector {
                     while let Some(op) = q.pop_front() {
                         match op {
                             // 追加
-                            IOOps::ADD(flag, fd, waker) => 
-                                self.add_event(flag, fd, waker, &mut t),
+                            IOOps::ADD(flag, fd, waker) => self.add_event(flag, fd, waker, &mut t),
                             // 削除
                             IOOps::REMOVE(fd) => self.rm_event(fd, &mut t),
                         }
@@ -162,7 +161,154 @@ impl IOSelector {
         q.push_back(IOOps::REMOVE(fd));
         write_eventfd(self.event, 1);
     }
+}
 
+struct AsyncListener {
+    listener: TcpListener,
+    selector: Arc<IOSelector>,
+}
+
+impl AsyncListener {
+    // TcpListenerの初期化処理をラップした関数
+    fn listen(addr: &str, selector: Arc<IOSelector>) -> AsyncListener {
+        let listener = TcpListener::bind(addr).unwrap();
+        // ノンブロッキングに指定
+        listener.set_nonblocking(true).unwrap();
+
+        AsyncListener {
+            listener: listener,
+            selector: selector,
+        }
+    }
+
+    // コネクションをアクセプトするためのFutureをリターン
+    fn accept(&self) -> Accept {
+        Accept { listener: self }
+    }
+}
+
+impl Drop for AsyncListener {
+    fn drop(&mut self) {
+        self.selector.unregister(self.listener.as_raw_fd());
+    }
+}
+
+struct Accept<'a> {
+    listener: &'a AsyncListener,
+}
+
+impl<'a> Future for Accept<'a> {
+    // 返り値の型
+    type Output = (
+        AsyncReader,          // 非同期読み込みストリーム
+        BufWriter<TcpStream>, // 書き込みストリーム
+        SocketAddr,
+    ); // アドレス
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // アクセプトをノンブロッキングで実行
+        match self.listener.accept() {
+            Ok((stream, addr)) => {
+                // アクセプトした場合は、読み込みと書き込み用オブジェクトをリターン
+                let stream0 = stream.try_clone().unwrap();
+                Poll::Ready((
+                    AsyncReader::new(stream0, self.listener.selector.clone()),
+                    BufWriter::new(stream),
+                    addr,
+                ))
+            }
+            Err(err) => {
+                // アクセプトすべきコネクションがない場合は、epollに登録
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    self.listener.selector.register(
+                        EpollFlags::EPOLLIN,
+                        self.listener.listener.as_raw_fd(),
+                        cx.waker().clone(),
+                    );
+                    Poll::Pending
+                } else {
+                    panic!("accept: {}", err);
+                }
+            }
+        }
+    }
+}
+
+struct AsyncReader {
+    fd: RawFd,
+    reader: BufReader<TcpStream>,
+    selector: Arc<IOSelector>,
+}
+
+impl AsyncReader {
+    fn new(stream: TcpStream, selector: Arc<IOSelector>) -> AsyncReader {
+        // ノンブロッキングに設定
+        stream.set_nonblocking(true).unwrap();
+
+        AsyncReader {
+            fd: stream.as_raw_fd(),
+            reader: BufReader::new(stream),
+            selector: stream,
+        }
+    }
+
+    fn read_line(&mut self) -> ReadLine {
+        ReadLine { reader: self }
+    }
+}
+
+impl Drop for AsyncReader {
+    fn drop(&mut self) {
+        self.selector.unregister(self.fd);
+    }
+}
+
+struct ReadLine<'a> {
+    reader: &'a mut AsyncReader,
+}
+
+impl<'a> Future for ReadLine<'a> {
+    // 返り値の型
+    type Output = Option<String>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut line = String::new();
+        // 非同期読み込み
+        match self.reader.reader.read_line(&mut line) {
+            Ok(0) => Poll::Ready(None),       // コネクションクローズ
+            Ok(_) => Poll::Ready(Some(line)), // 1行読み込み成功
+            Err(err) => {
+                // 読み込みできない場合はepollに登録 <2>
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    self.reader.selector.register(
+                        EpollFlags::EPOLLIN,
+                        self.reader.fd,
+                        cx.waker().clone(),
+                    );
+                    Poll::Pending
+                } else {
+                    Poll::Ready(None)
+                }
+            }
+        }
+    }
+}
+
+struct Task {
+    // 実行するコルーチン
+    future: Mutex<BoxFuture<'static, ()>>,
+    // Executorへスケジューリングするためのチャネル
+    sender: SyncSender<Arc<Task>>,
+}
+
+struct Executor {
+    // 実行キュー
+    sender: SyncSender<Arc<Task>>,
+    receiver: Receiver<Arc<Task>>,
+}
+
+struct Spawner {
+    sender: SyncSender<Arc<Task>>,
 }
 
 fn main() {
