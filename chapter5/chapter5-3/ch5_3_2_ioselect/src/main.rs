@@ -4,12 +4,12 @@ use futures::{
 };
 use nix::{
     errno::Errno,
-    libc::epoll_create1,
     sys::{
         epoll::{
-            epoll_create1, epoll_ctl, epoll_wait, EpollCreateFlags, EpollEvent, EpollFlags, EpollOp,
+            epoll_create1, epoll_ctl, epoll_wait,
+            EpollCreateFlags, EpollEvent, EpollFlags, EpollOp,
         },
-        eventfd::{eventfd, EfdFlags},
+        eventfd::{eventfd, EfdFlags}, // eventfd用のインポート <1>
     },
     unistd::{read, write},
 };
@@ -31,14 +31,14 @@ fn write_eventfd(fd: RawFd, n: usize) {
     // usizeを*const u8に変換
     let ptr = &n as *const usize as *const u8;
     // ポインタと長さからスライスを作成する
-    let val = unsafe { std::slice::from_raw_parts(prt, std::mem::size_of_val(&n)) };
+    let val = unsafe { std::slice::from_raw_parts(ptr, std::mem::size_of_val(&n)) };
     // writeシステムコール呼び出し
     write(fd, &val).unwrap();
 }
 
 enum IOOps {
     // epollへ追加
-    ADD(EpollCreateFlags, RawFd, Waker),
+    ADD(EpollFlags, RawFd, Waker),
     // epollから削除
     REMOVE(RawFd),
 }
@@ -59,7 +59,7 @@ impl IOSelector {
         let s = IOSelector {
             wakers: Mutex::new(HashMap::new()),
             queue: Mutex::new(VecDeque::new()),
-            epfd: unsafe { epoll_create1(EpollCreateFlags::empty()).unwrap() },
+            epfd: epoll_create1(EpollCreateFlags::empty()).unwrap(),
             // eventfd生成
             event: eventfd(0, EfdFlags::empty()).unwrap(),
         };
@@ -99,6 +99,8 @@ impl IOSelector {
                 }
             }
         }
+        assert!(!wakers.contains_key(&fd));
+        wakers.insert(fd, waker);
     }
 
     // epollの監視から削除するための関数
@@ -207,7 +209,7 @@ impl<'a> Future for Accept<'a> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // アクセプトをノンブロッキングで実行
-        match self.listener.accept() {
+        match self.listener.listener.accept() {
             Ok((stream, addr)) => {
                 // アクセプトした場合は、読み込みと書き込み用オブジェクトをリターン
                 let stream0 = stream.try_clone().unwrap();
@@ -248,7 +250,7 @@ impl AsyncReader {
         AsyncReader {
             fd: stream.as_raw_fd(),
             reader: BufReader::new(stream),
-            selector: stream,
+            selector: selector,
         }
     }
 
@@ -278,7 +280,7 @@ impl<'a> Future for ReadLine<'a> {
             Ok(0) => Poll::Ready(None),       // コネクションクローズ
             Ok(_) => Poll::Ready(Some(line)), // 1行読み込み成功
             Err(err) => {
-                // 読み込みできない場合はepollに登録 <2>
+                // 読み込みできない場合はepollに登録
                 if err.kind() == std::io::ErrorKind::WouldBlock {
                     self.reader.selector.register(
                         EpollFlags::EPOLLIN,
@@ -301,16 +303,90 @@ struct Task {
     sender: SyncSender<Arc<Task>>,
 }
 
+impl ArcWake for Task {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        // 自身をスケジューリング
+        let self0 = arc_self.clone();
+        arc_self.sender.send(self0).unwrap();
+    }
+}
+
 struct Executor {
     // 実行キュー
     sender: SyncSender<Arc<Task>>,
     receiver: Receiver<Arc<Task>>,
 }
 
+impl Executor {
+    fn new() -> Self {
+        // チャネルを生成
+        let (sender, receiver) = sync_channel(1024);
+        Executor {
+            sender: sender.clone(),
+            receiver,
+        }
+    }
+
+    fn get_spawner(&self) -> Spawner {
+        Spawner { sender: self.sender.clone() }
+    }
+
+    fn run(&self) {
+        // チャネルからTaskを受信して順に実行
+        while let Ok(task) = self.receiver.recv() {
+            // コンテキストを作成
+            let mut future = task.future.lock().unwrap();
+            let waker = waker_ref(&task);
+            let mut ctx = Context::from_waker(&waker);
+            // pollを呼び出し実行
+            let _ = future.as_mut().poll(&mut ctx);
+        }
+    }
+}
+
 struct Spawner {
     sender: SyncSender<Arc<Task>>,
 }
 
+impl Spawner {
+    fn spawn(&self, future: impl Future<Output = ()> + 'static + Send) {
+        // FutureをBox化
+        let future = future.boxed();
+        // Task生成
+        let task = Arc::new(Task {    
+            future: Mutex::new(future),
+            sender: self.sender.clone(),
+        });
+
+        // 実行キューにエンキュー
+        self.sender.send(task).unwrap();
+    }
+}
+
 fn main() {
-    println!("Hello, world!");
+    let executor = Executor::new();
+    let selector = IOSelector::new();
+    let spawner = executor.get_spawner();
+
+    let server = async move {
+        let listener = AsyncListener::listen("127.0.0.1:10000", selector.clone());
+
+        loop {
+            // 非同期コネクションアクセプト
+            let (mut reader, mut writer, addr) = listener.accept().await;
+            println!("accept: {}", addr);
+
+            // コネクション毎にタスクを作成
+            spawner.spawn(async move {
+                while let Some(buf) = reader.read_line().await {
+                    print!("read: {}, {}", addr, buf);
+                    writer.write(buf.as_bytes()).unwrap();
+                    writer.flush().unwrap();
+                }
+                println!("close: {}", addr);
+            });
+        }
+    };
+    executor.get_spawner().spawn(server);
+    executor.run();
 }
